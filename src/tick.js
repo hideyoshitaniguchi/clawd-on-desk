@@ -104,6 +104,29 @@ function scheduleSoon(maxDelay = BOOST_TICK_MS) {
   }
 }
 
+// Hard re-arm entry for system resume / unlock-screen (#408). Unlike
+// scheduleSoon(), this ignores the existing-timer guard: after an OS suspend a
+// pending setTimeout can be left non-null yet never fire, and scheduleSoon()
+// would refuse to replace such a "due soon" timer. We clear the cursor
+// baseline so the first post-wake movement registers as moved. Returns
+// pre-rearm diagnostics so the wake handler can log whether the tick was the
+// stale component (overdueMs large = the timer never fired during suspend).
+function forceMainTickNow() {
+  const diag = {
+    wasActive: mainTickActive,
+    hadTimer: !!mainTickTimer,
+    overdueMs: nextMainTickAt ? Math.max(0, Date.now() - nextMainTickAt) : null,
+  };
+  lastCursorX = null;
+  lastCursorY = null;
+  if (mainTickActive) {
+    scheduleNextTick(0);
+  } else {
+    startMainTick();
+  }
+  return diag;
+}
+
 function getPointerBridgeKey() {
   const state = ctx.currentState;
   if (!POINTER_BRIDGE_STATES.has(state)) return null;
@@ -379,6 +402,6 @@ Object.defineProperty(startMainTick, '_mouseStillSince', {
   get() { return mouseStillSince; },
 });
 
-return { startMainTick, resetIdleTimer, cleanup, refreshTheme, scheduleSoon, get _mouseStillSince() { return mouseStillSince; } };
+return { startMainTick, resetIdleTimer, cleanup, refreshTheme, scheduleSoon, forceMainTickNow, get _mouseStillSince() { return mouseStillSince; } };
 
 };

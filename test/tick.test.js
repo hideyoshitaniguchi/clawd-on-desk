@@ -547,3 +547,93 @@ describe("tick adaptive polling", () => {
     assert.equal(cursorCalls, callsAfterEyeMove + 1);
   });
 });
+
+describe("tick forceMainTickNow (system wake re-arm)", () => {
+  let cursor;
+  let cursorCalls;
+  let loader;
+  let tickApi;
+  let ctx;
+  let statesSeen;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    cursor = { x: 40, y: 40 };
+    cursorCalls = 0;
+    loader = loadTickWithScreen(() => {
+      cursorCalls++;
+      return { ...cursor };
+    });
+    statesSeen = [];
+  });
+
+  afterEach(() => {
+    if (tickApi) tickApi.cleanup();
+    if (loader) loader.restore();
+    mock.timers.reset();
+    tickApi = null;
+    ctx = null;
+  });
+
+  it("revives an inactive loop and polls immediately", () => {
+    ctx = makeCtx(cloneTheme(_defaultTheme), statesSeen);
+    tickApi = loader.initTick(ctx);
+    // loop never started → inactive, no pending timer; scheduleSoon() would
+    // no-op here, so the wake handler relies on this hard entry instead.
+    const diag = tickApi.forceMainTickNow();
+    assert.equal(diag.wasActive, false);
+    assert.equal(diag.hadTimer, false);
+    assert.equal(diag.overdueMs, null);
+
+    mock.timers.tick(1);
+    assert.ok(cursorCalls > 0, "forceMainTickNow should start the loop and poll");
+  });
+
+  it("hard re-arms an active idle loop, pulling the next poll forward", () => {
+    ctx = makeCtx(cloneTheme(_defaultTheme), statesSeen);
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+    mock.timers.tick(3000); // settle into the slow (~250ms) idle cadence
+
+    const diag = tickApi.forceMainTickNow();
+    assert.equal(diag.wasActive, true);
+    assert.equal(diag.hadTimer, true);
+    assert.equal(typeof diag.overdueMs, "number"); // pending future timer → 0 here
+
+    const before = cursorCalls;
+    mock.timers.tick(5); // 5ms ≪ idle cadence: only the delay-0 re-armed tick can fire
+    assert.ok(cursorCalls > before, "forceMainTickNow should pull the next poll forward");
+  });
+
+  it("reports a large overdueMs when the pending tick was frozen by suspend", () => {
+    ctx = makeCtx(cloneTheme(_defaultTheme), statesSeen);
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+    mock.timers.tick(3000); // establish a pending idle timer
+
+    // Simulate an OS suspend: wall clock jumps far forward but the pending
+    // setTimeout never fires (setTime moves Date without running timers).
+    mock.timers.setTime(Date.now() + 100000);
+
+    const diag = tickApi.forceMainTickNow();
+    assert.ok(diag.overdueMs >= 50000, `expected large overdueMs, got ${diag.overdueMs}`);
+  });
+
+  it("re-arms mini-sleep so a hovering cursor still triggers peek on wake", () => {
+    // mini-sleep has no wake poll, but mini mode keeps cursor-polling, so the
+    // tick re-arm alone is enough to recover peek-on-hover after resume.
+    let peekInCalls = 0;
+    ctx = makeCtx(cloneTheme(_defaultTheme), statesSeen);
+    ctx.miniMode = true;
+    ctx.currentState = "mini-sleep";
+    ctx.miniPeekIn = () => { peekInCalls++; };
+    cursor = { x: 40, y: 40 }; // inside the default hit rect (0..120)
+    tickApi = loader.initTick(ctx);
+
+    tickApi.forceMainTickNow(); // wake path: hard re-arm (not normal startMainTick)
+    mock.timers.tick(60);
+
+    assert.equal(peekInCalls, 1);
+    assert.equal(ctx.miniSleepPeeked, true);
+  });
+});

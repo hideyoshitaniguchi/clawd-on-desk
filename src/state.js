@@ -660,6 +660,34 @@ function wakeFromDoze() {
   }, 350);
 }
 
+// System resume / unlock-screen (#408): the pet may be parked in a
+// sleep-sequence state whose only exit is a timer — the wake-poll setInterval,
+// or yawning's autoReturnTimer — that an OS suspend can leave stalled, so it
+// never tracks the cursor again. Nudge it awake from any parked sleep state.
+// We act ONLY from a sleep state (never from a non-sleep one), so we don't add
+// a resolve on top of whatever the pet is already showing. The
+// dozing/sleeping/collapsing path reuses the exact wake transition a real
+// cursor wake plays — including its eventual session resolve — so it is not a
+// new sound source, just the normal wake. yawning has no wake poll and no
+// waking transition, so send it straight back to the cursor-following idle
+// base. Returns the state we nudged from, else null (nothing parked → the wake
+// handler's tick re-arm covers it).
+function resumeFromSystemWake() {
+  if (ctx.doNotDisturb) return null;
+  const from = currentState;
+  if (from === "yawning") {
+    // applyState("idle") clears the pending yawning→dozing autoReturnTimer.
+    applyState("idle", SVG_IDLE_FOLLOW);
+    return from;
+  }
+  if (from === "dozing" || from === "sleeping" || from === "collapsing") {
+    stopWakePoll();
+    wakeFromDoze();
+    return from;
+  }
+  return null;
+}
+
 function pickDisplayHint(state, existing, incoming) {
   return pickDisplayHintWithMap(state, existing, incoming, DISPLAY_HINT_MAP);
 }
@@ -2002,7 +2030,7 @@ return {
   setState, applyState, updateSession, resolveDisplayState, resolveVisualBinding, setUpdateVisualState,
   shouldDropForDnd,
   enableDoNotDisturb, disableDoNotDisturb,
-  startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
+  startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll, resumeFromSystemWake,
   getSvgOverride, cleanStaleSessions, startStartupRecovery, refreshTheme,
   detectRunningAgentProcesses, buildSessionSnapshot,
   emitSessionSnapshot, broadcastSessionSnapshot, getLastSessionSnapshot,

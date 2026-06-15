@@ -3299,3 +3299,67 @@ describe("antigravity trailing PostToolUse filter", () => {
     assert.ok(after.lastToolBoundaryAt > after.lastStopAt, "new turn should refresh tool boundary after Stop");
   });
 });
+
+describe("resumeFromSystemWake (#408 system wake)", () => {
+  let ctx;
+  let api;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx();
+    api = require("../src/state")(ctx);
+  });
+
+  afterEach(() => {
+    api.cleanup();
+    mock.timers.reset();
+  });
+
+  it("wakes a yawning pet straight back to idle (#408 narrow window)", () => {
+    // yawning has no wake poll and its only exit is a (suspend-stalled)
+    // autoReturnTimer, so it must be handled explicitly.
+    api.applyState("yawning");
+    assert.equal(api.getCurrentState(), "yawning");
+
+    const from = api.resumeFromSystemWake();
+    assert.equal(from, "yawning");
+    assert.equal(api.getCurrentState(), "idle");
+  });
+
+  it("routes a dozing pet through the wake path back to idle", () => {
+    api.applyState("dozing");
+    assert.equal(api.getCurrentState(), "dozing");
+
+    const from = api.resumeFromSystemWake();
+    assert.equal(from, "dozing");
+
+    mock.timers.tick(400); // wakeFromDoze settles dozing → idle after ~350ms
+    assert.equal(api.getCurrentState(), "idle");
+  });
+
+  it("plays the wake transition for a sleeping pet, then resolves to idle", () => {
+    api.applyState("sleeping");
+    assert.equal(api.getCurrentState(), "sleeping");
+
+    const from = api.resumeFromSystemWake();
+    assert.equal(from, "sleeping");
+    // clawd (full sleep mode) plays its waking transition, then auto-returns to
+    // the resolved display state (idle with no active sessions).
+    assert.equal(api.getCurrentState(), "waking");
+    mock.timers.tick(1600); // > wakeDuration (1500)
+    assert.equal(api.getCurrentState(), "idle");
+  });
+
+  it("is a no-op when the pet is not parked in a sleep state", () => {
+    assert.equal(api.getCurrentState(), "idle");
+    assert.equal(api.resumeFromSystemWake(), null);
+    assert.equal(api.getCurrentState(), "idle");
+  });
+
+  it("does nothing under Do Not Disturb", () => {
+    api.applyState("sleeping");
+    ctx.doNotDisturb = true;
+    assert.equal(api.resumeFromSystemWake(), null);
+    assert.equal(api.getCurrentState(), "sleeping");
+  });
+});

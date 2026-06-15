@@ -1,4 +1,4 @@
-const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, clipboard } = require("electron");
+const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, powerMonitor, clipboard } = require("electron");
 // ── Linux/Wayland: relaunch under XWayland so the pet is draggable (issue #441) ──
 // Native Wayland ignores client-side window positioning and blocks global cursor
 // queries, so the pet spawns centered, can't be dragged, and has no tracking;
@@ -3296,6 +3296,47 @@ function createWindow() {
   screen.on("display-metrics-changed", () => petWindowRuntime.handleDisplayMetricsChanged());
   screen.on("display-removed", () => petWindowRuntime.handleDisplayRemoved());
   screen.on("display-added", () => petWindowRuntime.handleDisplayAdded());
+
+  // #408: nothing else in the app listens for the power lifecycle, so after a
+  // system suspend the pet's passive cursor-tracking chain is left un-armed —
+  // the main tick, the wake poll, the low-power mirror, or the renderer can
+  // each be left stale, and the eyes stop following the cursor until an
+  // unrelated event (drag / state change) happens to re-arm one of them.
+  // Re-arm every candidate on resume. The exact stale component can't be
+  // pinned from code, so we cover all of them AND log diagnostics (state at
+  // wake, low-power flag, tick staleness) that help narrow which one it was on
+  // a real-machine wake — they won't rule out every candidate (renderer rAF,
+  // powerMonitor event ordering, display settle), but they point at the most
+  // likely one. Debounced + idempotent: Windows fires resume/unlock-screen in
+  // bursts and can repeat them.
+  let systemWakeDebounceTimer = null;
+  const handleSystemWake = (trigger) => {
+    if (systemWakeDebounceTimer) return;
+    systemWakeDebounceTimer = setTimeout(() => { systemWakeDebounceTimer = null; }, 500);
+    try {
+      const stateAtWake = _state.getCurrentState();
+      const lowPowerAtWake = lowPowerIdlePaused;
+      const tickDiag = _tick.forceMainTickNow();
+      setLowPowerIdlePaused(false);
+      setForceEyeResend(true);
+      const nudgedFrom = _state.resumeFromSystemWake();
+      sessionLog(
+        `system-wake trigger=${trigger} stateAtWake=${stateAtWake} ` +
+        `lowPowerPausedAtWake=${lowPowerAtWake ? 1 : 0} ` +
+        `tickActive=${tickDiag.wasActive ? 1 : 0} tickHadTimer=${tickDiag.hadTimer ? 1 : 0} ` +
+        `tickOverdueMs=${tickDiag.overdueMs == null ? "-" : tickDiag.overdueMs} ` +
+        `nudgedFrom=${nudgedFrom || "-"}`
+      );
+    } catch (err) {
+      safeConsoleError("Clawd: system-wake handler failed:", err && err.message);
+    }
+  };
+  try {
+    powerMonitor.on("resume", () => handleSystemWake("resume"));
+    powerMonitor.on("unlock-screen", () => handleSystemWake("unlock-screen"));
+  } catch (err) {
+    safeConsoleError("Clawd: failed to register powerMonitor wake handlers:", err && err.message);
+  }
 
   // textScale is per-display: when the topology changes, window→display
   // mappings (and therefore effective scales) can change wholesale. Debounced
