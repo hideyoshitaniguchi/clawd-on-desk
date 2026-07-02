@@ -910,6 +910,114 @@ describe("CodexLogMonitor", () => {
     });
   });
 
+  it("does not replay a stale session touched after monitor start (#566)", () => {
+    // Codex Desktop touches old rollouts on launch: the fresh mtime defeats
+    // the file-level backfill gate, and with the pet running for days every
+    // historical line is NEWER than monitor start — a start-anchored
+    // timestamp guard replays the whole finished session as live
+    // thinking/working. The guard must anchor on attach time instead.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const histTs = new Date(Date.now() - 30 * 1000).toISOString();
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ timestamp: histTs, type: "session_meta", payload: { cwd: "/tmp" } }),
+      JSON.stringify({ timestamp: histTs, type: "event_msg", payload: { type: "task_started" } }),
+      JSON.stringify({ timestamp: histTs, type: "response_item", payload: { type: "function_call", name: "shell_command", arguments: "{}" } }),
+      JSON.stringify({ timestamp: histTs, type: "event_msg", payload: { type: "task_complete" } }),
+      // The write Codex Desktop makes on launch — the only genuinely new line.
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { last_token_usage: { total_tokens: 1000 }, model_context_window: 200000 },
+        },
+      }),
+    ].join("\n") + "\n");
+    // File mtime is "now" (just written) — the touched-stale-rollout shape.
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ state, event, extra });
+    });
+    // Pet has been running for an hour; the session above ran 30s ago.
+    monitor._startedAtMs = Date.now() - 60 * 60 * 1000;
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    const replayed = events.filter((e) =>
+      e.state === "thinking" || e.state === "working" || e.state === "attention");
+    assert.deepStrictEqual(replayed, [], `stale states replayed: ${JSON.stringify(events)}`);
+    // The live token_count still lands, as idle metadata.
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].event, "event_msg:token_count");
+    assert.strictEqual(events[0].state, "idle");
+  });
+
+  it("attaches a session finished during a poll gap as silent backfill (#566)", () => {
+    // A session runs and finishes while polling is paused (laptop asleep).
+    // On wake the file's mtime is minutes old but still inside the 5 min
+    // pickup window, and every line is newer than monitor start. It must
+    // backfill silently — a completed turn stays completed.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const histTs = new Date(Date.now() - 4 * 60 * 1000).toISOString();
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ timestamp: histTs, type: "session_meta", payload: { cwd: "/tmp" } }),
+      JSON.stringify({ timestamp: histTs, type: "event_msg", payload: { type: "task_started" } }),
+      JSON.stringify({ timestamp: histTs, type: "response_item", payload: { type: "function_call", name: "shell_command", arguments: "{}" } }),
+      JSON.stringify({ timestamp: histTs, type: "event_msg", payload: { type: "task_complete" } }),
+    ].join("\n") + "\n");
+    const old = new Date(Date.now() - 4 * 60 * 1000);
+    fs.utimesSync(testFile, old, old);
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event) => {
+      events.push({ state, event });
+    });
+    monitor._startedAtMs = Date.now() - 60 * 60 * 1000;
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.deepStrictEqual(events, [], `expected silent backfill, got: ${JSON.stringify(events)}`);
+  });
+
+  it("does not replay attention from a metadata-only token_count write (#535)", () => {
+    // After a turn completes (attention already shown once), Codex Desktop
+    // writes token_count on focus/refresh. Carrying the one-shot attention
+    // forward would replay the celebration out of thin air.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{}"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event) => {
+      events.push({ state, event });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.strictEqual(events[events.length - 1].state, "attention");
+
+    fs.appendFileSync(testFile, JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: { last_token_usage: { total_tokens: 2000 }, model_context_window: 200000 },
+      },
+    }) + "\n");
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    const last = events[events.length - 1];
+    assert.strictEqual(last.event, "event_msg:token_count");
+    assert.strictEqual(last.state, "idle",
+      `token_count must not re-emit one-shot attention, got: ${last.state}`);
+  });
+
   it("should handle corrupted JSON lines gracefully", (_, done) => {
     const testFile = path.join(dateDir, TEST_FILENAME);
     fs.writeFileSync(testFile, [

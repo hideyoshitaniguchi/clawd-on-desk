@@ -3,14 +3,20 @@
 // Zero external dependencies (node built-ins + local Codex helpers only)
 //
 // Replay protection is two layers — change one, consider the other:
-//   1. Line-level: _processLine skips entries whose `timestamp` field is
-//      older than monitor start. Only helps lines that carry a timestamp.
+//   1. Line-level: _processLine skips entries whose `timestamp` field
+//      predates the file's ATTACH time. Only helps lines that carry a
+//      timestamp.
 //   2. File-level: _pollFile sets tracked.backfilling when attaching to a
-//      file whose mtime predates monitor start. _processLine then suppresses
-//      historical emits until the first read drains, then
+//      file whose mtime predates its attach time. _processLine then
+//      suppresses historical emits until the first read drains, then
 //      _emitBackfillSnapshot may synthesize ONE current sustained state
 //      (thinking / working). Works for any line shape,
 //      covers what layer 1 can't.
+// Both layers anchor on the per-file attach time, NOT monitor start (#566):
+// with the pet running for days, a stale rollout that Codex Desktop touches
+// on launch gets attached long after monitor start — every historical line
+// is "newer than start" and a start-anchored guard replays the whole
+// session as live thinking/working.
 // The two overlap but don't duplicate each other — collapsing them takes a
 // refactor, not a tweak.
 
@@ -33,12 +39,18 @@ const RECENT_DAY_DIR_CACHE_MS = 60 * 60 * 1000; // 1 hour
 // so slow Codex desktop sessions (3–5 min write cadence) aren't dropped by one
 // path only to be rescued by the other.
 const ACTIVE_SESSION_WINDOW_MS = 5 * 60 * 1000;
-// Grace window around monitor start. A file with content whose last write
-// predates this window is treated as pre-existing history on attach — we
-// replay it silently (backfill) instead of emitting stale transitions. A
+// Grace window around a file's attach time. A file with content whose last
+// write predates this window is treated as pre-existing history on attach —
+// we replay it silently (backfill) instead of emitting stale transitions. A
 // file written within the grace window is a live session and emits normally.
+// The same window anchors the line-level timestamp guard in _processLine.
 const BACKFILL_GRACE_MS = 5 * 1000;
-const BACKFILL_SNAPSHOT_STATES = new Set(["thinking", "working"]);
+// States that are ongoing rather than one-shot: safe to re-synthesize from a
+// backfill snapshot, and safe for a metadata-only token_count write to carry
+// forward. One-shot states (attention, sweeping, …) must never be re-emitted
+// from replayed or metadata-only records — that replays a finished turn's
+// celebration animation out of thin air (#535).
+const SUSTAINED_ACTIVE_STATES = new Set(["thinking", "working"]);
 
 function finiteNonnegativeNumber(value) {
   const n = Number(value);
@@ -325,8 +337,10 @@ class CodexLogMonitor {
       const retired = this._retiredTracked.get(filePath) || null;
       const resumeOffset = retired && stat.size >= retired.offset ? retired.offset : 0;
       if (retired) this._retiredTracked.delete(filePath);
+      const attachedAtMs = Date.now();
       tracked = {
         offset: resumeOffset,
+        attachedAtMs,
         sessionId: "codex:" + sessionId,
         filePath,
         cwd: retired ? retired.cwd : "",
@@ -344,16 +358,19 @@ class CodexLogMonitor {
         assistantLastOutput: retired ? retired.assistantLastOutput || null : null,
         assistantLastOutputTruncated: retired ? retired.assistantLastOutputTruncated === true : false,
         contextUsage: retired ? retired.contextUsage || null : null,
-        // Backfill mode: only a file whose last write predates monitor
-        // start (by more than BACKFILL_GRACE_MS) is treated as stale
+        // Backfill mode: only a file whose last write predates its attach
+        // time (by more than BACKFILL_GRACE_MS) is treated as stale
         // history — we replay it silently to advance offset + pick up
         // cwd/sessionTitle without emitting old transitions. Files written
         // inside the grace window are live sessions and emit normally.
+        // Anchored on attach, not monitor start: a session that ran while
+        // the machine slept (poll paused) is attached minutes later and its
+        // finished turns must not replay as live states (#566).
         // Empty files have nothing to replay.
         backfilling:
           !retired &&
           stat.size > 0 &&
-          stat.mtimeMs < this._startedAtMs - BACKFILL_GRACE_MS,
+          stat.mtimeMs < attachedAtMs - BACKFILL_GRACE_MS,
       };
       this._tracked.set(filePath, tracked);
     }
@@ -419,11 +436,18 @@ class CodexLogMonitor {
       this._applySessionMeta(payload, tracked);
     }
 
-    // Skip historical events that predate monitor start — prevents replay
-    // storms on app restart from driving stale state transitions.
+    // Skip historical events that predate this file's attach time — prevents
+    // replay storms from driving stale state transitions. Anchoring on attach
+    // (not monitor start) also covers the #566 shape: Codex Desktop touches a
+    // stale rollout on launch, its fresh mtime defeats the file-level backfill
+    // gate, and with the pet running for days every historical line is newer
+    // than monitor start — only the attach anchor rejects them.
     if (obj && typeof obj.timestamp === "string") {
       const ts = Date.parse(obj.timestamp);
-      if (!tracked.backfilling && Number.isFinite(ts) && ts < this._startedAtMs - 1500) return;
+      const attachedAtMs = Number.isFinite(tracked.attachedAtMs)
+        ? tracked.attachedAtMs
+        : this._startedAtMs;
+      if (!tracked.backfilling && Number.isFinite(ts) && ts < attachedAtMs - BACKFILL_GRACE_MS) return;
     }
 
     const assistantText = extractAssistantTextFromRecord(obj);
@@ -438,7 +462,14 @@ class CodexLogMonitor {
       if (contextUsage) {
         tracked.contextUsage = contextUsage;
         if (!tracked.backfilling) {
-          this._emitStateChange(tracked, tracked.lastState || "idle", key);
+          // Carry only sustained states. A metadata-only write against an
+          // idle session (Codex Desktop refreshes token_count on focus)
+          // must not re-emit a one-shot like attention — that replays the
+          // finished turn's celebration out of thin air (#535).
+          const carry = SUSTAINED_ACTIVE_STATES.has(tracked.lastState)
+            ? tracked.lastState
+            : "idle";
+          this._emitStateChange(tracked, carry, key);
         }
       }
       return;
@@ -635,7 +666,7 @@ class CodexLogMonitor {
 
   _emitBackfillSnapshot(tracked) {
     const snapshotState = tracked.lastState;
-    if (!BACKFILL_SNAPSHOT_STATES.has(snapshotState)) {
+    if (!SUSTAINED_ACTIVE_STATES.has(snapshotState)) {
       if (tracked.contextUsage) {
         this._emitStateChange(tracked, "idle", "event_msg:token_count");
       }
