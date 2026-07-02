@@ -28,8 +28,19 @@ function makeConfig(tmpDir) {
   };
 }
 
-const TEST_FILENAME = "rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl";
-const EXPECTED_SID = "codex:019d23d4-f1a9-7633-b9c7-758327137228";
+// Helper: rollout filename whose creation stamp is `ageMs` in the past.
+// The monitor reads this stamp as a staleness signal, so tests exercising
+// a live session must use a fresh stamp, not a hardcoded old date.
+function rolloutFilename(uuid, ageMs = 0) {
+  const d = new Date(Date.now() - ageMs);
+  const p = (n) => String(n).padStart(2, "0");
+  return `rollout-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` +
+    `T${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}-${uuid}.jsonl`;
+}
+
+const TEST_UUID = "019d23d4-f1a9-7633-b9c7-758327137228";
+const TEST_FILENAME = rolloutFilename(TEST_UUID);
+const EXPECTED_SID = "codex:" + TEST_UUID;
 
 describe("CodexLogMonitor", () => {
   let tmpDir, dateDir, monitor;
@@ -980,6 +991,66 @@ describe("CodexLogMonitor", () => {
     monitor._pollFile(testFile, path.basename(testFile));
 
     assert.deepStrictEqual(events, [], `expected silent backfill, got: ${JSON.stringify(events)}`);
+  });
+
+  it("does not replay a touched stale rollout whose lines carry no timestamps (#566)", () => {
+    // Timestamp-less lines slip past the line-level guard, so the touched
+    // stale shape (fresh mtime, old content) must be caught by the
+    // file-level gate via the filename creation stamp: an old name with a
+    // fresh mtime means something touched a stale rollout.
+    const fileName = rolloutFilename("11111111-dead-7bee-8888-000000000001", 2 * 60 * 60 * 1000);
+    const testFile = path.join(dateDir, fileName);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{}"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+    // mtime is "now" — the touch that re-surfaced this file.
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event) => {
+      events.push({ state, event });
+    });
+    monitor._startedAtMs = Date.now() - 60 * 60 * 1000;
+
+    monitor._pollFile(testFile, fileName);
+
+    assert.deepStrictEqual(events, [],
+      `timestamp-less stale lines replayed: ${JSON.stringify(events)}`);
+  });
+
+  it("restores the sustained state when a stale-named session turns live again (#566 guard regression)", () => {
+    // A long-lived Codex Desktop session lives in an old day dir, so its
+    // discovery lags behind the write that re-activates it (active-dir scan
+    // cache + poll interval). The late-arriving task_started lands in the
+    // backfill drain — the pet must still end up showing thinking via the
+    // backfill snapshot, not stay idle.
+    const fileName = rolloutFilename("22222222-dead-7bee-8888-000000000002", 3 * 24 * 60 * 60 * 1000);
+    const testFile = path.join(dateDir, fileName);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      JSON.stringify({
+        // The user's fresh prompt, written ~8s before discovery — beyond
+        // the line-guard grace window.
+        timestamp: new Date(Date.now() - 8 * 1000).toISOString(),
+        type: "event_msg",
+        payload: { type: "task_started" },
+      }),
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event) => {
+      events.push({ state, event });
+    });
+    monitor._startedAtMs = Date.now() - 60 * 60 * 1000;
+
+    monitor._pollFile(testFile, fileName);
+
+    assert.deepStrictEqual(events.map((e) => e.state), ["thinking"],
+      `expected snapshot to restore thinking, got: ${JSON.stringify(events)}`);
   });
 
   it("does not replay attention from a metadata-only token_count write (#535)", () => {

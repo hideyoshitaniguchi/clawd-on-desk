@@ -7,7 +7,9 @@
 //      predates the file's ATTACH time. Only helps lines that carry a
 //      timestamp.
 //   2. File-level: _pollFile sets tracked.backfilling when attaching to a
-//      file whose mtime predates its attach time. _processLine then
+//      file whose mtime predates its attach time, OR whose filename
+//      creation stamp is older than the active-session window (a touched
+//      stale rollout has a fresh mtime but an old name). _processLine then
 //      suppresses historical emits until the first read drains, then
 //      _emitBackfillSnapshot may synthesize ONE current sustained state
 //      (thinking / working). Works for any line shape,
@@ -338,6 +340,9 @@ class CodexLogMonitor {
       const resumeOffset = retired && stat.size >= retired.offset ? retired.offset : 0;
       if (retired) this._retiredTracked.delete(filePath);
       const attachedAtMs = Date.now();
+      const createdAtMs = this._extractFilenameTimeMs(fileName);
+      const createdLongBeforeAttach =
+        createdAtMs !== null && createdAtMs < attachedAtMs - ACTIVE_SESSION_WINDOW_MS;
       tracked = {
         offset: resumeOffset,
         attachedAtMs,
@@ -358,19 +363,25 @@ class CodexLogMonitor {
         assistantLastOutput: retired ? retired.assistantLastOutput || null : null,
         assistantLastOutputTruncated: retired ? retired.assistantLastOutputTruncated === true : false,
         contextUsage: retired ? retired.contextUsage || null : null,
-        // Backfill mode: only a file whose last write predates its attach
-        // time (by more than BACKFILL_GRACE_MS) is treated as stale
-        // history — we replay it silently to advance offset + pick up
-        // cwd/sessionTitle without emitting old transitions. Files written
-        // inside the grace window are live sessions and emit normally.
-        // Anchored on attach, not monitor start: a session that ran while
-        // the machine slept (poll paused) is attached minutes later and its
-        // finished turns must not replay as live states (#566).
+        // Backfill mode: attach-time content is stale history when EITHER
+        //   - the last write predates attach by more than the grace window
+        //     (a session that ran while polling was paused, e.g. lid-close
+        //     sleep, must not replay its finished turns as live — #566), OR
+        //   - the file itself was CREATED more than the active-session
+        //     window before attach (filename stamp). A fresh mtime on an
+        //     old file means something touched a stale rollout (Codex
+        //     Desktop writes metadata on launch) — that write defeats the
+        //     mtime check above, and timestamp-less historical lines would
+        //     defeat the line-level guard, so the creation stamp is the
+        //     only reliable stale signal for that shape.
+        // History replays silently to advance offset + pick up
+        // cwd/sessionTitle; _emitBackfillSnapshot then restores a sustained
+        // state if one is current. Anchored on attach, not monitor start.
         // Empty files have nothing to replay.
         backfilling:
           !retired &&
           stat.size > 0 &&
-          stat.mtimeMs < attachedAtMs - BACKFILL_GRACE_MS,
+          (stat.mtimeMs < attachedAtMs - BACKFILL_GRACE_MS || createdLongBeforeAttach),
       };
       this._tracked.set(filePath, tracked);
     }
@@ -462,10 +473,12 @@ class CodexLogMonitor {
       if (contextUsage) {
         tracked.contextUsage = contextUsage;
         if (!tracked.backfilling) {
-          // Carry only sustained states. A metadata-only write against an
-          // idle session (Codex Desktop refreshes token_count on focus)
-          // must not re-emit a one-shot like attention — that replays the
-          // finished turn's celebration out of thin air (#535).
+          // Carry only sustained states; one-shots (attention, sweeping)
+          // re-emit as idle. The main-process consumer already treats
+          // token_count as metadata-only (preserveState), so this is
+          // defense in depth for any consumer that applies the state —
+          // a metadata write against an idle session must never look like
+          // the turn completing again.
           const carry = SUSTAINED_ACTIVE_STATES.has(tracked.lastState)
             ? tracked.lastState
             : "idle";
@@ -560,6 +573,19 @@ class CodexLogMonitor {
       if (summary && summary !== "none" && summary !== "auto") return summary;
     }
     return null;
+  }
+
+  // Extract the session creation time encoded in the rollout filename
+  // (local time, matching how Codex names the file). Returns ms epoch or
+  // null when the name doesn't carry a parseable stamp.
+  _extractFilenameTimeMs(fileName) {
+    const m = /^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-/.exec(fileName);
+    if (!m) return null;
+    const ts = new Date(
+      Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+      Number(m[4]), Number(m[5]), Number(m[6])
+    ).getTime();
+    return Number.isFinite(ts) ? ts : null;
   }
 
   // Extract UUID from rollout filename
